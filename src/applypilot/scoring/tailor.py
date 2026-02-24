@@ -18,7 +18,9 @@ from pathlib import Path
 
 from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
-from applypilot.llm import get_client
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from applypilot.llm import get_client, get_worker_count
 from applypilot.scoring.validator import (
     BANNED_WORDS,
     FABRICATION_WATCHLIST,
@@ -453,9 +455,69 @@ def tailor_resume(
     return tailored, report
 
 
+# ── Per-Job Worker (for ThreadPoolExecutor) ──────────────────────────────
+
+def _tailor_one_job(resume_text: str, job: dict, profile: dict,
+                    validation_mode: str) -> dict:
+    """Process one job: LLM call + file writes. Called from worker thread."""
+    try:
+        tailored, report = tailor_resume(resume_text, job, profile,
+                                         validation_mode=validation_mode)
+
+        # Build safe filename prefix
+        safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
+        safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
+        prefix = f"{safe_site}_{safe_title}"
+
+        # Save tailored resume text
+        txt_path = TAILORED_DIR / f"{prefix}.txt"
+        txt_path.write_text(tailored, encoding="utf-8")
+
+        # Save job description for traceability
+        job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
+        job_desc = (
+            f"Title: {job['title']}\n"
+            f"Company: {job['site']}\n"
+            f"Location: {job.get('location', 'N/A')}\n"
+            f"Score: {job.get('fit_score', 'N/A')}\n"
+            f"URL: {job['url']}\n\n"
+            f"{job.get('full_description', '')}"
+        )
+        job_path.write_text(job_desc, encoding="utf-8")
+
+        # Save validation report
+        report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+        # Generate PDF for approved resumes (best-effort)
+        pdf_path = None
+        if report["status"] in ("approved", "approved_with_judge_warning"):
+            try:
+                from applypilot.scoring.pdf import convert_to_pdf
+                pdf_path = str(convert_to_pdf(txt_path))
+            except Exception:
+                log.debug("PDF generation failed for %s", txt_path, exc_info=True)
+
+        return {
+            "url": job["url"],
+            "path": str(txt_path),
+            "pdf_path": pdf_path,
+            "title": job["title"],
+            "site": job["site"],
+            "status": report["status"],
+            "attempts": report["attempts"],
+        }
+    except Exception as e:
+        log.error("[ERROR] %s -- %s", job["title"][:40], e)
+        return {
+            "url": job["url"], "title": job["title"], "site": job["site"],
+            "status": "error", "attempts": 0, "path": None, "pdf_path": None,
+        }
+
+
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
-def run_tailoring(min_score: int = 7, limit: int = 20,
+def run_tailoring(min_score: int = 7, limit: int = 500,
                   validation_mode: str = "normal") -> dict:
     """Generate tailored resumes for high-scoring jobs.
 
@@ -478,99 +540,52 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         return {"approved": 0, "failed": 0, "errors": 0, "elapsed": 0.0}
 
     TAILORED_DIR.mkdir(parents=True, exist_ok=True)
-    log.info("Tailoring resumes for %d jobs (score >= %d)...", len(jobs), min_score)
+    get_client()  # Warm up singleton before spawning workers
+    workers = get_worker_count()
+    log.info("Tailoring %d jobs with %d worker(s) (score >= %d)...", len(jobs), workers, min_score)
     t0 = time.time()
     completed = 0
     results: list[dict] = []
     stats: dict[str, int] = {"approved": 0, "failed_validation": 0, "failed_judge": 0, "error": 0}
 
-    for job in jobs:
-        completed += 1
-        try:
-            tailored, report = tailor_resume(resume_text, job, profile,
-                                             validation_mode=validation_mode)
-
-            # Build safe filename prefix
-            safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
-            safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-            prefix = f"{safe_site}_{safe_title}"
-
-            # Save tailored resume text
-            txt_path = TAILORED_DIR / f"{prefix}.txt"
-            txt_path.write_text(tailored, encoding="utf-8")
-
-            # Save job description for traceability
-            job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
-            job_desc = (
-                f"Title: {job['title']}\n"
-                f"Company: {job['site']}\n"
-                f"Location: {job.get('location', 'N/A')}\n"
-                f"Score: {job.get('fit_score', 'N/A')}\n"
-                f"URL: {job['url']}\n\n"
-                f"{job.get('full_description', '')}"
-            )
-            job_path.write_text(job_desc, encoding="utf-8")
-
-            # Save validation report
-            report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
-            report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-
-            # Generate PDF for approved resumes (best-effort)
-            # "approved_with_judge_warning" is also a success — resume was generated.
-            pdf_path = None
-            if report["status"] in ("approved", "approved_with_judge_warning"):
-                try:
-                    from applypilot.scoring.pdf import convert_to_pdf
-                    pdf_path = str(convert_to_pdf(txt_path))
-                except Exception:
-                    log.debug("PDF generation failed for %s", txt_path, exc_info=True)
-
-            result = {
-                "url": job["url"],
-                "path": str(txt_path),
-                "pdf_path": pdf_path,
-                "title": job["title"],
-                "site": job["site"],
-                "status": report["status"],
-                "attempts": report["attempts"],
-            }
-        except Exception as e:
-            result = {
-                "url": job["url"], "title": job["title"], "site": job["site"],
-                "status": "error", "attempts": 0, "path": None, "pdf_path": None,
-            }
-            log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), job["title"][:40], e)
-
-        results.append(result)
-        stats[result.get("status", "error")] = stats.get(result.get("status", "error"), 0) + 1
-
-        elapsed = time.time() - t0
-        rate = completed / elapsed if elapsed > 0 else 0
-        log.info(
-            "%d/%d [%s] attempts=%s | %.1f jobs/min | %s",
-            completed, len(jobs),
-            result["status"].upper(),
-            result.get("attempts", "?"),
-            rate * 60,
-            result["title"][:40],
-        )
-
-    # Persist to DB: increment attempt counter for ALL, save path only for approved
     now = datetime.now(timezone.utc).isoformat()
     _success_statuses = {"approved", "approved_with_judge_warning"}
-    for r in results:
-        if r["status"] in _success_statuses:
-            conn.execute(
-                "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
-                "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (r["path"], now, r["url"]),
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_job = {
+            executor.submit(_tailor_one_job, resume_text, job, profile, validation_mode): job
+            for job in jobs
+        }
+        for future in as_completed(future_to_job):
+            result = future.result()
+            results.append(result)
+            completed += 1
+            stats[result.get("status", "error")] = stats.get(result.get("status", "error"), 0) + 1
+
+            # Persist to DB incrementally so dashboard funnel updates live
+            if result["status"] in _success_statuses:
+                conn.execute(
+                    "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
+                    "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                    (result["path"], now, result["url"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                    (result["url"],),
+                )
+            conn.commit()
+
+            elapsed = time.time() - t0
+            rate = completed / elapsed if elapsed > 0 else 0
+            log.info(
+                "%d/%d [%s] attempts=%s | %.1f jobs/min | %s",
+                completed, len(jobs),
+                result["status"].upper(),
+                result.get("attempts", "?"),
+                rate * 60,
+                result["title"][:40],
             )
-        else:
-            conn.execute(
-                "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (r["url"],),
-            )
-    conn.commit()
 
     elapsed = time.time() - t0
     log.info(

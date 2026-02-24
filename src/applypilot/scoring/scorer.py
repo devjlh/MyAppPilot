@@ -13,7 +13,9 @@ from datetime import datetime, timezone
 
 from applypilot.config import RESUME_PATH, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
-from applypilot.llm import get_client
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from applypilot.llm import get_client, get_worker_count
 
 log = logging.getLogger(__name__)
 
@@ -131,35 +133,44 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
         columns = jobs[0].keys()
         jobs = [dict(zip(columns, row)) for row in jobs]
 
-    log.info("Scoring %d jobs sequentially...", len(jobs))
+    get_client()  # Warm up singleton before spawning workers
+    workers = get_worker_count()
+    log.info("Scoring %d jobs with %d worker(s)...", len(jobs), workers)
     t0 = time.time()
     completed = 0
     errors = 0
     results: list[dict] = []
 
-    for job in jobs:
-        result = score_job(resume_text, job)
-        result["url"] = job["url"]
-        completed += 1
-
-        if result["score"] == 0:
-            errors += 1
-
-        results.append(result)
-
-        log.info(
-            "[%d/%d] score=%d  %s",
-            completed, len(jobs), result["score"], job.get("title", "?")[:60],
-        )
-
-    # Write scores to DB
     now = datetime.now(timezone.utc).isoformat()
-    for r in results:
-        conn.execute(
-            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
-            (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
-        )
-    conn.commit()
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_job = {
+            executor.submit(score_job, resume_text, job): job
+            for job in jobs
+        }
+        for future in as_completed(future_to_job):
+            job = future_to_job[future]
+            try:
+                result = future.result()
+            except Exception as e:
+                result = {"score": 0, "keywords": "", "reasoning": f"Error: {e}"}
+            result["url"] = job["url"]
+            results.append(result)
+            completed += 1
+            if result["score"] == 0:
+                errors += 1
+
+            # Persist to DB incrementally so dashboard funnel updates live
+            conn.execute(
+                "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
+                (result["score"], f"{result['keywords']}\n{result['reasoning']}", now, result["url"]),
+            )
+            conn.commit()
+
+            log.info(
+                "[%d/%d] score=%d  %s",
+                completed, len(jobs), result["score"], job.get("title", "?")[:60],
+            )
 
     elapsed = time.time() - t0
     log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", len(results), elapsed, len(results) / elapsed if elapsed > 0 else 0)

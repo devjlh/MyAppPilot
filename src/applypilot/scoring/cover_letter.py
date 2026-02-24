@@ -13,7 +13,9 @@ from datetime import datetime, timezone
 
 from applypilot.config import COVER_LETTER_DIR, RESUME_PATH, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
-from applypilot.llm import get_client
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from applypilot.llm import get_client, get_worker_count
 from applypilot.scoring.validator import (
     BANNED_WORDS,
     LLM_LEAK_PHRASES,
@@ -183,9 +185,49 @@ def generate_cover_letter(
     return letter  # last attempt even if failed
 
 
+# ── Per-Job Worker (for ThreadPoolExecutor) ──────────────────────────────
+
+def _generate_one_cover_letter(resume_text: str, job: dict, profile: dict,
+                               validation_mode: str) -> dict:
+    """Process one job: generate cover letter + file writes. Called from worker thread."""
+    try:
+        letter = generate_cover_letter(resume_text, job, profile,
+                                       validation_mode=validation_mode)
+
+        # Build safe filename prefix
+        safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
+        safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
+        prefix = f"{safe_site}_{safe_title}"
+
+        cl_path = COVER_LETTER_DIR / f"{prefix}_CL.txt"
+        cl_path.write_text(letter, encoding="utf-8")
+
+        # Generate PDF (best-effort)
+        pdf_path = None
+        try:
+            from applypilot.scoring.pdf import convert_to_pdf
+            pdf_path = str(convert_to_pdf(cl_path))
+        except Exception:
+            log.debug("PDF generation failed for %s", cl_path, exc_info=True)
+
+        return {
+            "url": job["url"],
+            "path": str(cl_path),
+            "pdf_path": pdf_path,
+            "title": job["title"],
+            "site": job["site"],
+        }
+    except Exception as e:
+        log.error("[ERROR] %s -- %s", job["title"][:40], e)
+        return {
+            "url": job["url"], "title": job["title"], "site": job["site"],
+            "path": None, "pdf_path": None, "error": str(e),
+        }
+
+
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
-def run_cover_letters(min_score: int = 7, limit: int = 20,
+def run_cover_letters(min_score: int = 7, limit: int = 500,
                       validation_mode: str = "normal") -> dict:
     """Generate cover letters for high-scoring jobs that have tailored resumes.
 
@@ -222,78 +264,54 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
         jobs = [dict(zip(columns, row)) for row in jobs]
 
     COVER_LETTER_DIR.mkdir(parents=True, exist_ok=True)
+    get_client()  # Warm up singleton before spawning workers
+    workers = get_worker_count()
     log.info(
-        "Generating cover letters for %d jobs (score >= %d)...",
-        len(jobs), min_score,
+        "Generating cover letters for %d jobs with %d worker(s) (score >= %d)...",
+        len(jobs), workers, min_score,
     )
     t0 = time.time()
     completed = 0
     results: list[dict] = []
     error_count = 0
 
-    for job in jobs:
-        completed += 1
-        try:
-            letter = generate_cover_letter(resume_text, job, profile,
-                                          validation_mode=validation_mode)
+    now = datetime.now(timezone.utc).isoformat()
+    saved = 0
 
-            # Build safe filename prefix
-            safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
-            safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-            prefix = f"{safe_site}_{safe_title}"
-
-            cl_path = COVER_LETTER_DIR / f"{prefix}_CL.txt"
-            cl_path.write_text(letter, encoding="utf-8")
-
-            # Generate PDF (best-effort)
-            pdf_path = None
-            try:
-                from applypilot.scoring.pdf import convert_to_pdf
-                pdf_path = str(convert_to_pdf(cl_path))
-            except Exception:
-                log.debug("PDF generation failed for %s", cl_path, exc_info=True)
-
-            result = {
-                "url": job["url"],
-                "path": str(cl_path),
-                "pdf_path": pdf_path,
-                "title": job["title"],
-                "site": job["site"],
-            }
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_job = {
+            executor.submit(_generate_one_cover_letter, resume_text, job, profile, validation_mode): job
+            for job in jobs
+        }
+        for future in as_completed(future_to_job):
+            result = future.result()
             results.append(result)
+            completed += 1
+            if not result.get("path"):
+                error_count += 1
+
+            # Persist to DB incrementally so dashboard funnel updates live
+            if result.get("path"):
+                conn.execute(
+                    "UPDATE jobs SET cover_letter_path=?, cover_letter_at=?, "
+                    "cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
+                    (result["path"], now, result["url"]),
+                )
+                saved += 1
+            else:
+                conn.execute(
+                    "UPDATE jobs SET cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
+                    (result["url"],),
+                )
+            conn.commit()
 
             elapsed = time.time() - t0
             rate = completed / elapsed if elapsed > 0 else 0
+            status = "OK" if result.get("path") else "ERROR"
             log.info(
-                "%d/%d [OK] | %.1f jobs/min | %s",
-                completed, len(jobs), rate * 60, result["title"][:40],
+                "%d/%d [%s] | %.1f jobs/min | %s",
+                completed, len(jobs), status, rate * 60, result["title"][:40],
             )
-        except Exception as e:
-            result = {
-                "url": job["url"], "title": job["title"], "site": job["site"],
-                "path": None, "pdf_path": None, "error": str(e),
-            }
-            error_count += 1
-            results.append(result)
-            log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), job["title"][:40], e)
-
-    # Persist to DB: increment attempt counter for ALL, save path only for successes
-    now = datetime.now(timezone.utc).isoformat()
-    saved = 0
-    for r in results:
-        if r.get("path"):
-            conn.execute(
-                "UPDATE jobs SET cover_letter_path=?, cover_letter_at=?, "
-                "cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
-                (r["path"], now, r["url"]),
-            )
-            saved += 1
-        else:
-            conn.execute(
-                "UPDATE jobs SET cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
-                (r["url"],),
-            )
-    conn.commit()
 
     elapsed = time.time() - t0
     log.info("Cover letters done in %.1fs: %d generated, %d errors", elapsed, saved, error_count)
